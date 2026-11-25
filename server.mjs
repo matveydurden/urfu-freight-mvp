@@ -91,7 +91,8 @@ export function createAppServer(store) {
 
       if (pathname === '/api/state' && method === 'GET') {
         const role = urlObj.searchParams.get('role') || 'logist';
-        return sendJson(res, 200, store.getStateForRole(role));
+        const carrierId = urlObj.searchParams.get('carrier') || undefined;
+        return sendJson(res, 200, store.getStateForRole(role, { carrierId }));
       }
 
       if (pathname === '/api/demo/reset' && method === 'POST') {
@@ -113,7 +114,8 @@ export function createAppServer(store) {
 
         if (sub === '' && method === 'GET') {
           const role = urlObj.searchParams.get('role') || 'logist';
-          const trip = store.getTripForRole(tripId, role);
+          const carrierId = urlObj.searchParams.get('carrier') || undefined;
+          const trip = store.getTripForRole(tripId, role, { carrierId });
           return sendJson(res, 200, { trip });
         }
 
@@ -158,7 +160,8 @@ export function createAppServer(store) {
           const result = store.exportAccounting(tripId);
           res.writeHead(200, {
             'Content-Type': 'text/csv; charset=utf-8',
-            'Content-Disposition': `attachment; filename="${result.record.fileName}"`,
+            // Заголовок допускает только ASCII; старые записи могли сохранить кириллицу в имени.
+            'Content-Disposition': `attachment; filename="${String(result.record.fileName).replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '_')}"`,
             'Cache-Control': 'no-store',
           });
           res.end(result.csvContent);

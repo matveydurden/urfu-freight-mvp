@@ -439,13 +439,52 @@ export function buildAccountingCsv(record) {
     ['Принятый документ', record.documentFileName],
     ['Локальный SHA-256 условий', record.sha256],
   ];
-  const escapeCsv = (val) => `"${String(val).replace(/"/g, '""')}"`;
+  // Ячейки, начинающиеся с = + - @ (а также TAB/CR), Excel воспринимает как формулы.
+  const escapeCsv = (val) => {
+    let text = String(val);
+    if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+    return `"${text.replace(/"/g, '""')}"`;
+  };
   return bom + rows.map((r) => r.map(escapeCsv).join(';')).join('\r\n') + '\r\n';
 }
 
+const MAX_RATE_RUB = 10_000_000;
+const MAX_LEN = { place: 120, cargo: 200, name: 120, note: 500, fileName: 200 };
+const REVIEWER_ROLES = ['logist', 'accountant'];
+
+function httpError(message, statusCode) {
+  return Object.assign(new Error(message), { statusCode });
+}
+
+function isValidIsoDate(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) return false;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+
+function isValidTime(value) {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+}
+
+function assertMaxLength(value, max, label) {
+  if (String(value).length > max) {
+    throw httpError(`${label}: не более ${max} символов`, 400);
+  }
+}
+
+// Для имён файлов: кириллическая «Р» из номера рейса -> «R», прочее не-ASCII -> «_».
+export function asciiFileSegment(text) {
+  return String(text)
+    .replace(/Р/g, 'R')
+    .replace(/[^A-Za-z0-9._-]/g, '_');
+}
+
 export class FreightStore {
-  constructor(dataFilePath) {
+  constructor(dataFilePath, { clock } = {}) {
     this.dataFilePath = dataFilePath;
+    this.clock = clock || (() => new Date());
     this.state = this._loadOrSeed();
   }
 
@@ -496,11 +535,49 @@ export class FreightStore {
     return trip;
   }
 
-  _assertRoleCanAccessTrip(trip, roleId) {
-    if (roleId === 'carrier' && trip.carrierId !== ROLES.carrier.carrierId) {
-      const err = new Error('Этот рейс назначен другому перевозчику');
-      err.statusCode = 403;
-      throw err;
+  _resolveActingCarrierId(carrierId) {
+    const id = carrierId || ROLES.carrier.carrierId;
+    if (!CARRIERS.some((c) => c.id === id)) {
+      throw httpError('Неизвестный перевозчик', 400);
+    }
+    return id;
+  }
+
+  _assertRoleCanAccessTrip(trip, roleId, carrierId) {
+    if (roleId === 'carrier' && trip.carrierId !== this._resolveActingCarrierId(carrierId)) {
+      throw httpError('Этот рейс назначен другому перевозчику', 403);
+    }
+  }
+
+  _assertNotExported(trip, what) {
+    if (trip.accounting.exportRecord) {
+      throw httpError(
+        `Рейс уже выгружен в бухгалтерию (${trip.accounting.exportRecord.dispatchNumber}): ${what} недоступно`,
+        409
+      );
+    }
+  }
+
+  // Самая ранняя допустимая дата погрузки: вчера по UTC (запас на часовые пояса).
+  _earliestLoadingDate() {
+    return new Date(this.clock().getTime() - 24 * 3600 * 1000).toISOString().slice(0, 10);
+  }
+
+  _assertValidTerms({ date, time, rate }, { checkPast }) {
+    if (!isValidIsoDate(date)) {
+      throw httpError('Дата погрузки указана неверно (ожидается существующая дата ГГГГ-ММ-ДД)', 400);
+    }
+    if (!isValidTime(time)) {
+      throw httpError('Время погрузки указано неверно (ожидается ЧЧ:ММ, 00:00–23:59)', 400);
+    }
+    if (checkPast && date < this._earliestLoadingDate()) {
+      throw httpError('Дата погрузки не может быть в прошлом', 400);
+    }
+    if (!Number.isFinite(rate) || Math.round(rate) < 1) {
+      throw httpError('Укажите корректную ставку в рублях', 400);
+    }
+    if (rate > MAX_RATE_RUB) {
+      throw httpError(`Ставка не может превышать ${MAX_RATE_RUB.toLocaleString('ru-RU')} ₽`, 400);
     }
   }
 
@@ -511,10 +588,17 @@ export class FreightStore {
     };
   }
 
-  getStateForRole(roleId = 'logist') {
-    const role = ROLES[roleId] || ROLES.logist;
+  getStateForRole(roleId = 'logist', { carrierId } = {}) {
+    const baseRole = ROLES[roleId] || ROLES.logist;
+    let role = baseRole;
+    let actingCarrierId = null;
+    if (baseRole.id === 'carrier') {
+      actingCarrierId = this._resolveActingCarrierId(carrierId);
+      const carrier = CARRIERS.find((c) => c.id === actingCarrierId);
+      role = { ...baseRole, carrierId: actingCarrierId, org: carrier.name };
+    }
     const visibleTrips = this.state.trips
-      .filter((t) => role.id !== 'carrier' || t.carrierId === role.carrierId)
+      .filter((t) => role.id !== 'carrier' || t.carrierId === actingCarrierId)
       .map((t) => this._serializeTrip(t));
 
     return {
@@ -531,9 +615,9 @@ export class FreightStore {
     };
   }
 
-  getTripForRole(tripId, roleId = 'logist') {
+  getTripForRole(tripId, roleId = 'logist', { carrierId } = {}) {
     const trip = this._getTripOrThrow(tripId);
-    this._assertRoleCanAccessTrip(trip, roleId);
+    this._assertRoleCanAccessTrip(trip, roleId, carrierId);
     return this._serializeTrip(trip);
   }
 
@@ -561,6 +645,11 @@ export class FreightStore {
     if (!carrier) {
       throw Object.assign(new Error('Выберите перевозчика'), { statusCode: 400 });
     }
+    this._assertValidTerms({ date: cleanDate, time: cleanTime, rate: numRate }, { checkPast: true });
+    assertMaxLength(cleanOrigin, MAX_LEN.place, 'Пункт отправления');
+    assertMaxLength(cleanDestination, MAX_LEN.place, 'Пункт назначения');
+    assertMaxLength(cleanCargo, MAX_LEN.cargo, 'Описание груза');
+    assertMaxLength(String(receiverName || '').trim(), MAX_LEN.name, 'Название получателя');
 
     const seq = this.state.nextTripSeq++;
     const now = this._nowIso();
@@ -627,6 +716,7 @@ export class FreightStore {
 
   proposeTerms(tripId, { loadingDate, loadingTime, rateRub, note }) {
     const trip = this._getTripOrThrow(tripId);
+    this._assertNotExported(trip, 'изменение условий');
     const latest = trip.versions[trip.versions.length - 1];
     const cleanDate = String(loadingDate || latest.loadingDate).trim();
     const cleanTime = String(loadingTime || latest.loadingTime).trim();
@@ -639,6 +729,11 @@ export class FreightStore {
     if (!Number.isFinite(numRate) || numRate <= 0) {
       throw Object.assign(new Error('Укажите корректную ставку в рублях'), { statusCode: 400 });
     }
+    this._assertValidTerms(
+      { date: cleanDate, time: cleanTime, rate: numRate },
+      { checkPast: cleanDate !== latest.loadingDate }
+    );
+    assertMaxLength(cleanNote, MAX_LEN.note, 'Комментарий');
 
     const baseVersion = getConfirmedVersion(trip) || latest;
     if (
@@ -702,9 +797,9 @@ export class FreightStore {
     return this._serializeTrip(trip);
   }
 
-  confirmTerms(tripId, { versionId, roleId = 'carrier' }) {
+  confirmTerms(tripId, { versionId, roleId = 'carrier', carrierId }) {
     const trip = this._getTripOrThrow(tripId);
-    this._assertRoleCanAccessTrip(trip, roleId);
+    this._assertRoleCanAccessTrip(trip, roleId, carrierId);
 
     const latest = trip.versions[trip.versions.length - 1];
     const target = trip.versions.find((v) => v.id === versionId);
@@ -745,6 +840,7 @@ export class FreightStore {
 
   updateDelivery(tripId, { action, disputeReason }) {
     const trip = this._getTripOrThrow(tripId);
+    this._assertNotExported(trip, 'изменение приёмки');
     const now = this._nowIso();
 
     if (action === 'confirm') {
@@ -768,6 +864,7 @@ export class FreightStore {
       if (!reason) {
         throw Object.assign(new Error('Укажите причину расхождения при приёмке'), { statusCode: 400 });
       }
+      assertMaxLength(reason, MAX_LEN.note, 'Причина расхождения');
       trip.delivery = {
         status: 'disputed',
         updatedAt: now,
@@ -791,9 +888,18 @@ export class FreightStore {
     return this._serializeTrip(trip);
   }
 
-  uploadDocument(tripId, { presetId, fileName, contentBase64, roleId = 'carrier' }) {
+  uploadDocument(tripId, { presetId, fileName, contentBase64, roleId = 'carrier', carrierId }) {
     const trip = this._getTripOrThrow(tripId);
-    this._assertRoleCanAccessTrip(trip, roleId);
+    this._assertRoleCanAccessTrip(trip, roleId, carrierId);
+    this._assertNotExported(trip, 'загрузка накладной');
+
+    const currentDoc = getLatestDocument(trip);
+    if (currentDoc && currentDoc.status === 'submitted') {
+      throw httpError('Предыдущая накладная ещё на проверке: дождитесь решения', 409);
+    }
+    if (currentDoc && currentDoc.status === 'accepted') {
+      throw httpError('Накладная уже принята: загрузить новую версию нельзя', 409);
+    }
 
     let resolvedName = '';
     let contentBuffer = null;
@@ -807,6 +913,7 @@ export class FreightStore {
       contentBuffer = Buffer.from(preset.content, 'utf8');
     } else if (fileName && contentBase64) {
       resolvedName = String(fileName).trim();
+      assertMaxLength(resolvedName, MAX_LEN.fileName, 'Имя файла');
       contentBuffer = Buffer.from(String(contentBase64), 'base64');
     } else {
       throw Object.assign(new Error('Выберите подготовленный пример документа или загрузите файл'), { statusCode: 400 });
@@ -854,7 +961,18 @@ export class FreightStore {
       throw Object.assign(new Error('Можно проверять только актуальную версию документа'), { statusCode: 409 });
     }
 
-    const roleObj = ROLES[reviewerRole] || ROLES.logist;
+    const roleObj = ROLES[reviewerRole];
+    if (!roleObj || !REVIEWER_ROLES.includes(roleObj.id)) {
+      throw httpError('Проверять накладные могут только логист и бухгалтер', 403);
+    }
+    if (doc.status !== 'submitted') {
+      throw httpError(
+        doc.status === 'accepted'
+          ? 'Накладная уже принята: решение изменить нельзя'
+          : 'Накладная возвращена перевозчику: дождитесь новой версии',
+        409
+      );
+    }
     const now = this._nowIso();
 
     if (decision === 'accept') {
@@ -877,6 +995,7 @@ export class FreightStore {
       if (!reason) {
         throw Object.assign(new Error('Укажите конкретное замечание для возврата документа'), { statusCode: 400 });
       }
+      assertMaxLength(reason, MAX_LEN.note, 'Замечание');
       doc.status = 'returned';
       doc.reviewComment = reason;
       doc.reviewedAt = now;
@@ -901,6 +1020,14 @@ export class FreightStore {
 
   exportAccounting(tripId) {
     const trip = this._getTripOrThrow(tripId);
+    if (trip.accounting.exportRecord) {
+      return {
+        created: false,
+        record: trip.accounting.exportRecord,
+        csvContent: buildAccountingCsv(trip.accounting.exportRecord),
+        trip: this._serializeTrip(trip),
+      };
+    }
     const summary = computeTripSummary(trip);
 
     if (!summary.settlement.ready) {
@@ -943,7 +1070,7 @@ export class FreightStore {
       documentStatus: 'Комплект принят',
       documentFileName: acceptedDoc.fileName,
       sha256: confirmed.sha256,
-      fileName: `sverka_1c_demo_${trip.number}_v${confirmed.version}.csv`,
+      fileName: `sverka_1c_demo_${asciiFileSegment(trip.number)}_v${confirmed.version}.csv`,
       demoLabel: 'Демонстрационная выгрузка для сверки с 1С',
     };
 

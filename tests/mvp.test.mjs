@@ -8,7 +8,8 @@ import { FreightStore } from '../src/store.mjs';
 function withTempStore(fn) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'urfu-freight-test-'));
   const dataFile = path.join(tmpDir, 'state.json');
-  const store = new FreightStore(dataFile);
+  // Фиксированные часы: даты рейсов в тесте не должны «протухать» с реальным временем
+  const store = new FreightStore(dataFile, { clock: () => new Date('2026-11-25T08:00:00Z') });
   try {
     fn({ store, dataFile });
   } finally {

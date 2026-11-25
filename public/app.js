@@ -1,5 +1,6 @@
 const appState = {
   roleId: 'logist',
+  carrierId: 'carrier-gromov',
   roles: [],
   carriers: [],
   demoDocumentPresets: [],
@@ -99,6 +100,7 @@ function showToast(message, type = 'info') {
 function persistViewPrefs() {
   try {
     localStorage.setItem('urfu_freight_role', appState.roleId);
+    localStorage.setItem('urfu_freight_carrier', appState.carrierId);
     if (appState.selectedTripId) {
       localStorage.setItem('urfu_freight_trip', appState.selectedTripId);
     }
@@ -117,6 +119,8 @@ function loadViewPrefs() {
   try {
     savedRoleLs = localStorage.getItem('urfu_freight_role');
     savedTripLs = localStorage.getItem('urfu_freight_trip');
+    const savedCarrier = localStorage.getItem('urfu_freight_carrier');
+    if (savedCarrier) appState.carrierId = savedCarrier;
   } catch {
     // Ignore storage errors
   }
@@ -168,7 +172,8 @@ async function switchRole(nextRole, { notice = true } = {}) {
 
 async function loadState({ keepSelection = true, switchNotice = false } = {}) {
   const prevTripId = appState.selectedTripId;
-  const data = await apiFetch(`/api/state?role=${encodeURIComponent(appState.roleId)}`);
+  const carrierQuery = appState.roleId === 'carrier' ? `&carrier=${encodeURIComponent(appState.carrierId)}` : '';
+  const data = await apiFetch(`/api/state?role=${encodeURIComponent(appState.roleId)}${carrierQuery}`);
   appState.roles = data.roles;
   appState.carriers = data.carriers;
   appState.demoDocumentPresets = data.demoDocumentPresets;
@@ -311,11 +316,29 @@ function renderTopbar() {
 
   const activeRole = appState.roles.find((r) => r.id === appState.roleId);
   if (activeRole) {
-    els.roleContextBar.innerHTML = `
-      <span>Вы: <strong>${esc(activeRole.person)}</strong>, ${esc(activeRole.org)}</span>
-      <span>·</span>
-      <span>${esc(activeRole.hint)}</span>
-    `;
+    if (activeRole.id === 'carrier') {
+      const isDefaultCarrier = appState.carrierId === 'carrier-gromov';
+      els.roleContextBar.innerHTML = `
+        <span>Вы: <strong>${isDefaultCarrier ? esc(activeRole.person) : 'Представитель перевозчика'}</strong>,
+          <select id="carrierSelect" class="inline-select" aria-label="Организация перевозчика">
+            ${appState.carriers.map((c) => `<option value="${esc(c.id)}" ${c.id === appState.carrierId ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}
+          </select>
+        </span>
+        <span>${esc(activeRole.hint)}</span>
+      `;
+      document.getElementById('carrierSelect').addEventListener('change', async (e) => {
+        appState.carrierId = e.target.value;
+        appState.selectedTripId = null;
+        appState.mobileDetailOpen = false;
+        resetForms();
+        await loadState({ keepSelection: false });
+      });
+    } else {
+      els.roleContextBar.innerHTML = `
+        <span>Вы: <strong>${esc(activeRole.person)}</strong>, ${esc(activeRole.org)}</span>
+        <span>${esc(activeRole.hint)}</span>
+      `;
+    }
   }
 
   els.openCreateModalBtn.classList.toggle('hidden', appState.roleId !== 'logist');
@@ -985,7 +1008,7 @@ function renderSheet(trip) {
       </div>
       <h2 class="sheet-route">${esc(trip.origin)}<span class="sep">—</span>${esc(trip.destination)}</h2>
       <div class="sheet-cargo">${esc(trip.cargo)}</div>
-      ${role === 'logist' ? `
+      ${role === 'logist' && !trip.accounting.exportRecord ? `
         <div class="sheet-actions">
           <button type="button" class="btn btn-secondary btn-sm" id="toggleProposeBtn">
             ${appState.showProposeForm ? 'Скрыть форму правки' : 'Изменить время и условия'}
@@ -1037,7 +1060,10 @@ function renderTripDetail() {
 
   bindDetailEvents(trip);
   document.querySelectorAll('[data-switch-role]').forEach((btn) => {
-    btn.addEventListener('click', () => switchRole(btn.dataset.switchRole, { notice: false }));
+    btn.addEventListener('click', () => {
+      if (btn.dataset.switchRole === 'carrier') appState.carrierId = trip.carrierId;
+      switchRole(btn.dataset.switchRole, { notice: false });
+    });
   });
 }
 
@@ -1130,7 +1156,7 @@ function bindDetailEvents(trip) {
       try {
         await apiFetch(`/api/trips/${encodeURIComponent(trip.id)}/confirm`, {
           method: 'POST',
-          body: JSON.stringify({ versionId, roleId: appState.roleId }),
+          body: JSON.stringify({ versionId, roleId: appState.roleId, carrierId: appState.carrierId }),
         });
         delete appState.integrityResultByTrip[trip.id];
         showToast('Новые условия подтверждены. История версий и SHA-256 обновлены.', 'success');
@@ -1205,6 +1231,7 @@ function bindDetailEvents(trip) {
           body: JSON.stringify({
             presetId: btn.dataset.presetId,
             roleId: appState.roleId,
+            carrierId: appState.carrierId,
           }),
         });
         showToast('Накладная приложена и отправлена на проверку.', 'success');
@@ -1228,6 +1255,7 @@ function bindDetailEvents(trip) {
             fileName: file.name,
             contentBase64,
             roleId: appState.roleId,
+            carrierId: appState.carrierId,
           }),
         });
         showToast(`Файл «${file.name}» приложен и отправлен на проверку.`, 'success');
