@@ -15,6 +15,8 @@ const MIME_TYPES = {
   '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.txt': 'text/plain; charset=utf-8',
 };
 
 function sendJson(res, statusCode, payload) {

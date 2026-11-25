@@ -6,7 +6,7 @@ const appState = {
   trips: [],
   selectedTripId: null,
   mobileDetailOpen: false,
-  lastRenderedTripId: null,
+  lastStampKey: null,
   tripFilter: 'all',
   showProposeForm: false,
   showDisputeForm: false,
@@ -644,7 +644,7 @@ function renderActionCard(trip) {
     body.push(`
       <div class="waiting-box">
         <span>${exported ? 'Рейс завершён, действий не требуется.' : `От вас ничего не требуется. Сейчас ход у: <strong>${esc(s.ownerLabel)}</strong>.`}</span>
-        ${canSwitch ? `<button type="button" class="btn btn-secondary btn-sm" data-switch-role="${esc(ownerRole)}">Показать глазами роли «${esc(ownerPerson.label)}» →</button>` : ''}
+        ${canSwitch ? `<button type="button" class="btn btn-secondary btn-sm" data-switch-role="${esc(ownerRole)}">Показать глазами роли «${esc(ownerPerson.label)}» </button>` : ''}
       </div>
     `);
   }
@@ -677,7 +677,7 @@ function renderActionCard(trip) {
       : `<span class="badge neutral plain">Ход: ${esc(s.ownerLabel)}</span>`;
 
   return `
-    <section class="action-card tone-${esc(nar.tone)}" aria-label="Что делать сейчас">
+    <section class="action-card tone-${esc(nar.tone)} ${mine ? 'mine' : 'waiting'}" aria-label="Что делать сейчас">
       <div class="action-head">
         <div>
           <div class="action-eyebrow">Что делать сейчас ${eyebrow}</div>
@@ -925,7 +925,81 @@ function renderSideCards(trip) {
     </section>
   `;
 
-  return facts + checklist + integrity + history;
+  return checklist + integrity + history;
+}
+
+
+function buildStamp(trip) {
+  const s = trip.summary;
+  const doc = s.latestDoc;
+  let title = 'К расчёту';
+  let tone = 'green';
+  if (trip.accounting.exportRecord) { title = 'Выгружено в 1С'; tone = 'blue'; }
+  else if (trip.delivery.status === 'disputed') { title = 'Спор'; tone = 'red'; }
+  else if (s.pendingVersion) { title = 'Согласование'; tone = 'blue'; }
+  else if (doc && doc.status === 'returned') { title = 'Возврат'; tone = 'red'; }
+  else if (doc && doc.status === 'submitted') { title = 'На проверке'; tone = 'blue'; }
+  else if (trip.delivery.status !== 'confirmed') { title = 'Ждём приёмку'; tone = 'blue'; }
+  else if (!doc) { title = 'Ждём накладную'; tone = 'blue'; }
+  const last = trip.history[trip.history.length - 1];
+  return { title, tone, date: last ? formatTimestamp(last.at) : '' };
+}
+
+function renderSheet(trip) {
+  const s = trip.summary;
+  const role = appState.roleId;
+  const confirmed = s.confirmedVersion;
+  const pending = s.pendingVersion;
+  const latest = trip.versions[trip.versions.length - 1];
+  const stamp = buildStamp(trip);
+  const stampKey = `${trip.id}:${stamp.title}`;
+  const hit = appState.lastStampKey !== stampKey;
+  appState.lastStampKey = stampKey;
+
+  const timeMain = confirmed
+    ? `${formatDateRu(confirmed.loadingDate)}, ${confirmed.loadingTime}`
+    : `${formatDateRu(latest.loadingDate)}, ${latest.loadingTime}`;
+  const timeSub = pending && confirmed
+    ? `Предложено: ${confirmed.loadingTime} → ${pending.loadingTime}`
+    : confirmed
+      ? `Согласована версия v${confirmed.version}`
+      : 'Ждём подтверждения перевозчика';
+  const rateMain = confirmed ? formatRub(confirmed.rateRub) : 'Не согласована';
+  const rateSub = pending && confirmed && pending.rateRub !== confirmed.rateRub
+    ? (role === 'accountant' ? 'Неподтверждённая ставка скрыта от расчёта' : `Предложено ${formatRub(pending.rateRub)}, не подтверждено`)
+    : confirmed
+      ? 'Подтверждена обеими сторонами'
+      : `Предложено логистом: ${formatRub(latest.rateRub)}`;
+
+  return `
+    <article class="sheet">
+      <div class="sheet-head">
+        <div class="sheet-no">
+          <span>Рейс № ${esc(trip.number)}</span>
+          <span class="sheet-tag">${trip.isDemo ? 'Демо-рейс' : 'Создан вручную'}</span>
+        </div>
+      </div>
+      <div class="stamp ${esc(stamp.tone)} ${hit ? 'hit' : ''}" aria-label="Статус рейса: ${esc(stamp.title)}">
+        <div class="stamp-title">${esc(stamp.title)}</div>
+        <div class="stamp-date">${esc(stamp.date)}</div>
+      </div>
+      <h2 class="sheet-route">${esc(trip.origin)}<span class="sep">—</span>${esc(trip.destination)}</h2>
+      <div class="sheet-cargo">${esc(trip.cargo)}</div>
+      ${role === 'logist' ? `
+        <div class="sheet-actions">
+          <button type="button" class="btn btn-secondary btn-sm" id="toggleProposeBtn">
+            ${appState.showProposeForm ? 'Скрыть форму правки' : 'Изменить время и условия'}
+          </button>
+        </div>` : ''}
+      <dl class="fields">
+        <div class="field-cell"><dt>Погрузка</dt><dd class="num">${esc(timeMain)}</dd><div class="sub">${esc(timeSub)}</div></div>
+        <div class="field-cell"><dt>Ставка</dt><dd class="amount">${esc(rateMain)}</dd><div class="sub">${esc(rateSub)}</div></div>
+        <div class="field-cell"><dt>Перевозчик</dt><dd>${esc(trip.carrierName)}</dd><div class="sub">Накладная: ${esc(s.docStatusLabel).toLowerCase()}</div></div>
+        <div class="field-cell"><dt>Получатель</dt><dd>${esc(trip.receiverName)}</dd><div class="sub">Отправитель: ${esc(trip.shipperName)}</div></div>
+      </dl>
+      ${renderStepper(trip)}
+    </article>
+  `;
 }
 
 function renderTripDetail() {
@@ -939,36 +1013,13 @@ function renderTripDetail() {
   els.emptyDetailState.classList.add('hidden');
   els.tripDetailContent.classList.remove('hidden');
 
-  const s = trip.summary;
   const role = appState.roleId;
 
-  const isNewTrip = appState.lastRenderedTripId !== trip.id;
-  appState.lastRenderedTripId = trip.id;
-
   els.tripDetailContent.innerHTML = `
-    <div class="detail-stack ${isNewTrip ? 'enter' : ''}">
+    <div class="detail-stack">
       <button type="button" class="btn btn-secondary btn-sm mobile-back-btn" id="mobileBackBtn">← К списку рейсов</button>
 
-      <section class="card hero">
-        <div class="hero-top">
-          <div class="hero-chips">
-            <span class="badge neutral plain num">${esc(trip.number)}</span>
-            ${trip.isDemo ? '<span class="badge warning plain">Демо-рейс</span>' : '<span class="badge neutral plain">Создан вручную</span>'}
-            <span class="badge ${esc(s.nextActionTone)}">${esc(s.nextAction)}</span>
-          </div>
-          ${role === 'logist' ? `
-            <button type="button" class="btn btn-secondary btn-sm" id="toggleProposeBtn">
-              ${appState.showProposeForm ? 'Скрыть форму правки' : 'Изменить время / условия'}
-            </button>` : ''}
-        </div>
-        <div class="route-line">
-          <span class="route-city">${esc(trip.origin)}</span>
-          <span class="route-path" aria-hidden="true"><span class="route-dot"></span><span class="route-rail"></span><span class="route-dot end"></span></span>
-          <span class="route-city">${esc(trip.destination)}</span>
-        </div>
-        <div class="hero-sub"><span>${esc(trip.cargo)}</span></div>
-        ${renderStepper(trip)}
-      </section>
+      ${renderSheet(trip)}
 
       <div class="detail-grid">
         <div class="detail-main">
