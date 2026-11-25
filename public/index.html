@@ -3,27 +3,29 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0f172a" />
   <title>РейсКонтроль — MVP грузоперевозок (УрФУ № 7684)</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <header class="topbar">
     <div class="topbar-inner">
-      <div class="brand-group">
-        <div class="brand-title">
-          <span class="brand-mark" aria-hidden="true">РК</span>
-          <div>
-            <div class="brand-name">РейсКонтроль</div>
-            <div class="brand-sub">УрФУ Startup Guide · заявка № 7684</div>
-          </div>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h11v9H3z"/><path d="M14 10h4l3 3v3h-7z"/><circle cx="7" cy="17.5" r="1.6"/><circle cx="17" cy="17.5" r="1.6"/></svg>
+        </span>
+        <div class="brand-text">
+          <div class="brand-name">РейсКонтроль</div>
+          <div class="brand-sub">УрФУ Startup Guide · заявка № 7684</div>
         </div>
-        <span class="demo-pill" title="Все организации, люди и документы вымышлены">Режим демонстрации</span>
+        <span class="demo-pill" title="Все организации, люди и документы вымышлены">Демо</span>
       </div>
 
-      <div class="role-switcher" role="tablist" aria-label="Переключатель деморолей" id="roleSwitcher"></div>
+      <nav class="role-switcher" role="tablist" aria-label="Переключатель деморолей" id="roleSwitcher"></nav>
 
       <div class="topbar-actions">
         <button type="button" class="btn btn-ghost btn-sm" id="resetDemoBtn" title="Вернуть демонстрационный рейс Р-2026-041 в исходное состояние (ручные рейсы сохранятся)">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 8a5.5 5.5 0 1 0 1.8-4.1"/><path d="M2.5 2.5v3h3"/></svg>
           Сбросить демо-рейс
         </button>
       </div>
@@ -42,12 +44,17 @@
         </div>
         <button type="button" class="btn btn-primary btn-sm" id="openCreateModalBtn">+ Новый рейс</button>
       </div>
+      <div class="filter-tabs" id="tripFilterTabs" role="tablist" aria-label="Фильтр рейсов"></div>
       <div class="trip-list" id="tripList"></div>
     </aside>
 
     <section class="trip-detail-pane" id="tripDetailPane">
       <div class="empty-state" id="emptyDetailState">
-        Выберите рейс из списка слева, чтобы открыть карточку согласования и документов.
+        <div class="empty-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h11v9H3z"/><path d="M14 10h4l3 3v3h-7z"/><circle cx="7" cy="17.5" r="1.6"/><circle cx="17" cy="17.5" r="1.6"/></svg>
+        </div>
+        <strong>Выберите рейс</strong>
+        <span>Откройте рейс из списка слева, чтобы увидеть условия, документы и следующий шаг.</span>
       </div>
       <div id="tripDetailContent" class="hidden"></div>
     </section>

@@ -6,6 +6,8 @@ const appState = {
   trips: [],
   selectedTripId: null,
   mobileDetailOpen: false,
+  lastRenderedTripId: null,
+  tripFilter: 'all',
   showProposeForm: false,
   showDisputeForm: false,
   showReturnDocForm: false,
@@ -20,6 +22,7 @@ const els = {
   toastArea: document.getElementById('toastArea'),
   workspace: document.getElementById('workspace'),
   tripListSubtitle: document.getElementById('tripListSubtitle'),
+  tripFilterTabs: document.getElementById('tripFilterTabs'),
   tripList: document.getElementById('tripList'),
   openCreateModalBtn: document.getElementById('openCreateModalBtn'),
   emptyDetailState: document.getElementById('emptyDetailState'),
@@ -29,6 +32,13 @@ const els = {
   createCarrierSelect: document.getElementById('createCarrierSelect'),
   closeCreateModalBtn: document.getElementById('closeCreateModalBtn'),
   cancelCreateModalBtn: document.getElementById('cancelCreateModalBtn'),
+};
+
+const ICON = {
+  check: '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5l3.2 3.2L13 4.5"/></svg>',
+  cross: '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>',
+  doc: '<svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 2.5h6.5L15 6v11.5H5z"/><path d="M11.5 2.5V6H15M7.5 10h5M7.5 13h5"/></svg>',
+  download: '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2v8M4.5 7L8 10.5 11.5 7M3 13.5h10"/></svg>',
 };
 
 function esc(str) {
@@ -66,6 +76,15 @@ function formatTimestamp(iso) {
   });
 }
 
+function initials(fullName) {
+  return String(fullName || '?')
+    .split(/\s+/)
+    .map((w) => w[0])
+    .slice(0, 2)
+    .join('')
+    .toUpperCase();
+}
+
 function showToast(message, type = 'info') {
   const node = document.createElement('div');
   node.className = `toast ${type}`;
@@ -93,12 +112,20 @@ function persistViewPrefs() {
 }
 
 function loadViewPrefs() {
+  let savedRoleLs = null;
+  let savedTripLs = null;
+  try {
+    savedRoleLs = localStorage.getItem('urfu_freight_role');
+    savedTripLs = localStorage.getItem('urfu_freight_trip');
+  } catch {
+    // Ignore storage errors
+  }
   const hash = window.location.hash.replace(/^#/, '');
   const params = new URLSearchParams(hash);
   const hashRole = params.get('role');
   const hashTrip = params.get('trip');
-  const savedRole = hashRole || localStorage.getItem('urfu_freight_role') || 'logist';
-  const savedTrip = hashTrip || localStorage.getItem('urfu_freight_trip') || 'trip-demo-7684';
+  const savedRole = hashRole || savedRoleLs || 'logist';
+  const savedTrip = hashTrip || savedTripLs || 'trip-demo-7684';
   appState.roleId = ['logist', 'carrier', 'receiver', 'accountant'].includes(savedRole)
     ? savedRole
     : 'logist';
@@ -124,6 +151,19 @@ async function apiFetch(url, options = {}) {
 
 function getSelectedTrip() {
   return appState.trips.find((t) => t.id === appState.selectedTripId) || null;
+}
+
+function resetForms() {
+  appState.showProposeForm = false;
+  appState.showDisputeForm = false;
+  appState.showReturnDocForm = false;
+}
+
+async function switchRole(nextRole, { notice = true } = {}) {
+  if (nextRole === appState.roleId) return;
+  appState.roleId = nextRole;
+  resetForms();
+  await loadState({ keepSelection: true, switchNotice: notice });
 }
 
 async function loadState({ keepSelection = true, switchNotice = false } = {}) {
@@ -160,42 +200,121 @@ function renderAll() {
   els.workspace.classList.toggle('mobile-detail-open', Boolean(appState.mobileDetailOpen && getSelectedTrip()));
 }
 
+/* ------------------------------------------------------------
+   Доменные хелперы для UX: «чей ход» и «что может сделать роль»
+   ------------------------------------------------------------ */
+
+function isMyTurn(trip, roleId = appState.roleId) {
+  const s = trip.summary;
+  if (trip.accounting.exportRecord) return false;
+  if (trip.delivery.status === 'disputed') return roleId === 'receiver' || roleId === 'logist';
+  if (s.latestDoc && s.latestDoc.status === 'submitted' && !s.pendingVersion) {
+    if (roleId === 'logist' || roleId === 'accountant') return true;
+  }
+  if (roleId === 'receiver' && trip.delivery.status !== 'confirmed' && !s.pendingVersion) return true;
+  if (roleId === 'carrier' && (s.pendingVersion || !s.latestDoc || s.latestDoc.status === 'returned')) return true;
+  if (roleId === 'accountant' && s.settlement.ready) return true;
+  return false;
+}
+
+function getRoleActions(trip, roleId = appState.roleId) {
+  const s = trip.summary;
+  const latestDoc = s.latestDoc;
+  const exported = Boolean(trip.accounting.exportRecord);
+  return {
+    confirmPending: roleId === 'carrier' && Boolean(s.pendingVersion),
+    upload: roleId === 'carrier' && (!latestDoc || latestDoc.status === 'returned'),
+    delivery: roleId === 'receiver' && trip.delivery.status !== 'confirmed',
+    disputeLate: roleId === 'receiver' && trip.delivery.status === 'confirmed' && !exported,
+    review: (roleId === 'logist' || roleId === 'accountant') && Boolean(latestDoc) && latestDoc.status === 'submitted',
+    export: roleId === 'accountant' && s.settlement.ready,
+  };
+}
+
+function hasPrimaryAction(actions) {
+  return actions.confirmPending || actions.upload || actions.delivery || actions.review || actions.export;
+}
+
+function buildStages(trip) {
+  const s = trip.summary;
+  const confirmed = s.confirmedVersion;
+  const pending = s.pendingVersion;
+  const doc = s.latestDoc;
+  const exported = Boolean(trip.accounting.exportRecord);
+
+  const terms = pending
+    ? { state: 'todo', note: confirmed ? `Правка v${pending.version} ждёт подтверждения` : 'Ждём перевозчика' }
+    : confirmed
+      ? { state: 'done', note: `Согласована v${confirmed.version}` }
+      : { state: 'todo', note: 'Ждём перевозчика' };
+
+  const delivery =
+    trip.delivery.status === 'confirmed'
+      ? { state: 'done', note: 'Груз получен' }
+      : trip.delivery.status === 'disputed'
+        ? { state: 'alert', note: 'Спор при приёмке' }
+        : { state: 'todo', note: 'Ждём получателя' };
+
+  const docs = !doc
+    ? { state: 'todo', note: 'Не загружена' }
+    : doc.status === 'accepted'
+      ? { state: 'done', note: 'Принята' }
+      : doc.status === 'returned'
+        ? { state: 'alert', note: 'Нужны исправления' }
+        : { state: 'todo', note: 'На проверке' };
+
+  const settle = exported
+    ? { state: 'done', note: `Распоряжение ${trip.accounting.exportRecord.dispatchNumber}` }
+    : s.settlement.ready
+      ? { state: 'todo', note: 'Готов к выгрузке' }
+      : s.settlement.status === 'manual_review'
+        ? { state: 'alert', note: 'Заблокирован' }
+        : { state: 'todo', note: 'Ожидает остальные шаги' };
+
+  const stages = [
+    { label: 'Условия', ...terms },
+    { label: 'Приёмка груза', ...delivery },
+    { label: 'Накладная', ...docs },
+    { label: 'Выгрузка в 1С', ...settle },
+  ];
+
+  const firstOpen = stages.findIndex((st) => st.state === 'todo');
+  if (firstOpen >= 0) stages[firstOpen].state = 'active';
+  return stages;
+}
+
+/* ------------------------------------------------------------
+   Топбар и список рейсов
+   ------------------------------------------------------------ */
+
 function renderTopbar() {
   els.roleSwitcher.innerHTML = appState.roles
-    .map(
-      (r) => `
+    .map((r) => {
+      return `
       <button
         type="button"
         role="tab"
         aria-selected="${r.id === appState.roleId}"
         class="role-btn ${r.id === appState.roleId ? 'active' : ''}"
         data-role="${esc(r.id)}"
+        title="${esc(r.person)} · ${esc(r.org)}"
       >
-        ${esc(r.label)}
-      </button>`
-    )
+        <span class="role-avatar" aria-hidden="true">${esc(initials(r.person))}</span>
+        <span class="role-name">${esc(r.label)}</span>
+      </button>`;
+    })
     .join('');
 
   els.roleSwitcher.querySelectorAll('.role-btn').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const nextRole = btn.dataset.role;
-      if (nextRole === appState.roleId) return;
-      appState.roleId = nextRole;
-      appState.showProposeForm = false;
-      appState.showDisputeForm = false;
-      appState.showReturnDocForm = false;
-      await loadState({ keepSelection: true, switchNotice: true });
-    });
+    btn.addEventListener('click', () => switchRole(btn.dataset.role));
   });
 
   const activeRole = appState.roles.find((r) => r.id === appState.roleId);
   if (activeRole) {
     els.roleContextBar.innerHTML = `
-      <div>
-        Вы вошли как: <span class="role-context-strong">${esc(activeRole.label)} — ${esc(activeRole.person)}</span>
-        (${esc(activeRole.org)}) · ${esc(activeRole.hint)}
-      </div>
-      <div>Переключение роли сохраняет открытую карточку при наличии доступа</div>
+      <span>Вы: <strong>${esc(activeRole.person)}</strong>, ${esc(activeRole.org)}</span>
+      <span>·</span>
+      <span>${esc(activeRole.hint)}</span>
     `;
   }
 
@@ -208,32 +327,49 @@ function renderTopbar() {
 }
 
 function renderTripList() {
-  const count = appState.trips.length;
-  if (appState.roleId === 'carrier') {
-    els.tripListSubtitle.textContent = `Назначенные вам рейсы: ${count}`;
-  } else {
-    els.tripListSubtitle.textContent = `Всего рейсов: ${count}`;
-  }
+  const all = appState.trips;
+  const mine = all.filter((t) => isMyTurn(t));
+  const filter = appState.tripFilter;
+  const shown = filter === 'mine' ? mine : all;
 
-  if (count === 0) {
+  els.tripListSubtitle.textContent =
+    appState.roleId === 'carrier' ? `Назначенные вам рейсы: ${all.length}` : `Всего рейсов: ${all.length}`;
+
+  els.tripFilterTabs.innerHTML = `
+    <button type="button" class="filter-tab ${filter === 'all' ? 'active' : ''}" data-filter="all">Все <span class="count">${all.length}</span></button>
+    <button type="button" class="filter-tab ${filter === 'mine' ? 'active' : ''}" data-filter="mine">Ваш ход <span class="count">${mine.length}</span></button>
+  `;
+  els.tripFilterTabs.querySelectorAll('.filter-tab').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      appState.tripFilter = btn.dataset.filter;
+      renderTripList();
+    });
+  });
+
+  if (all.length === 0) {
     els.tripList.innerHTML = `<div class="empty-state">Рейсов пока нет.</div>`;
     return;
   }
+  if (shown.length === 0) {
+    els.tripList.innerHTML = `<div class="empty-state">Сейчас от вас ничего не требуется.<br/>Все рейсы ждут других участников.</div>`;
+    return;
+  }
 
-  els.tripList.innerHTML = appState.trips
+  els.tripList.innerHTML = shown
     .map((trip) => {
       const s = trip.summary;
       const isSelected = trip.id === appState.selectedTripId;
+      const mineTurn = isMyTurn(trip);
       const shownRate = s.confirmedVersion
         ? formatRub(s.confirmedVersion.rateRub)
-        : `${formatRub(trip.versions[0]?.rateRub)} (не согл.)`;
+        : `${formatRub(trip.versions[0]?.rateRub)} · не согл.`;
       const shownTime = s.confirmedVersion ? s.confirmedVersion.loadingTime : trip.versions[0]?.loadingTime;
       const pendingMark = s.pendingVersion && s.confirmedVersion
         ? ` · правка ${s.confirmedVersion.loadingTime} → ${s.pendingVersion.loadingTime}`
         : '';
 
       return `
-        <button type="button" class="trip-row ${isSelected ? 'selected' : ''}" data-trip-id="${esc(trip.id)}">
+        <button type="button" class="trip-row ${isSelected ? 'selected' : ''} ${mineTurn ? 'my-turn' : ''}" data-trip-id="${esc(trip.id)}">
           <div class="trip-row-top">
             <span class="trip-number num">${esc(trip.number)}${trip.isDemo ? ' · демо' : ''}</span>
             <span class="trip-rate num">${esc(shownRate)}</span>
@@ -245,7 +381,7 @@ function renderTripList() {
           </div>
           <div class="trip-row-footer">
             <span class="badge ${esc(s.nextActionTone)}">${esc(s.nextAction)}</span>
-            <span class="owner-label">Сейчас: ${esc(s.ownerLabel)}</span>
+            <span class="turn-label ${mineTurn ? 'mine' : ''}">${mineTurn ? 'Ваш ход' : `Ход: ${esc(s.ownerLabel)}`}</span>
           </div>
         </button>
       `;
@@ -256,143 +392,540 @@ function renderTripList() {
     row.addEventListener('click', () => {
       appState.selectedTripId = row.dataset.tripId;
       appState.mobileDetailOpen = true;
-      appState.showProposeForm = false;
-      appState.showDisputeForm = false;
-      appState.showReturnDocForm = false;
+      resetForms();
       persistViewPrefs();
       renderAll();
+      window.scrollTo({ top: 0 });
     });
   });
 }
 
+/* ------------------------------------------------------------
+   Карточка рейса
+   ------------------------------------------------------------ */
+
 function renderVersionStatusBadge(status) {
   if (status === 'confirmed') return '<span class="badge success">Согласована</span>';
-  if (status === 'pending') return '<span class="badge warning">Ожидает подтверждения перевозчика</span>';
-  return '<span class="badge neutral">Заменена новой</span>';
+  if (status === 'pending') return '<span class="badge warning">Ждёт перевозчика</span>';
+  return '<span class="badge neutral">Заменена</span>';
 }
 
 function renderDocStatusBadge(status) {
-  if (status === 'accepted') return '<span class="badge success">Комплект принят</span>';
-  if (status === 'returned') return '<span class="badge danger">Исправить накладную</span>';
+  if (status === 'accepted') return '<span class="badge success">Принята</span>';
+  if (status === 'returned') return '<span class="badge danger">Возвращена</span>';
   return '<span class="badge info">На проверке</span>';
 }
 
-function renderActionBanner(trip) {
+function renderStepper(trip) {
+  const stages = buildStages(trip);
+  return `
+    <ol class="stepper" aria-label="Этапы рейса">
+      ${stages
+        .map(
+          (st, i) => `
+        <li class="step ${st.state}" ${st.state === 'active' ? 'aria-current="step"' : ''}>
+          <span class="step-dot">${st.state === 'done' ? ICON.check : st.state === 'alert' ? '!' : i + 1}</span>
+          <span class="step-text">
+            <span class="step-label">${esc(st.label)}</span>
+            <span class="step-note" style="display:block">${esc(st.note)}</span>
+          </span>
+        </li>`
+        )
+        .join('')}
+    </ol>
+  `;
+}
+
+function buildNarrative(trip) {
   const s = trip.summary;
   const role = appState.roleId;
   const confirmed = s.confirmedVersion;
   const pending = s.pendingVersion;
+  const doc = s.latestDoc;
 
-  // 1. Dispute takes top priority
   if (trip.delivery.status === 'disputed') {
-    return `
-      <div class="action-banner danger">
-        <div>
-          <div class="action-banner-title">На ручной проверке — зафиксирован спор при приёмке</div>
-          <div class="action-banner-text">
-            Причина: <strong>${esc(trip.delivery.disputeReason)}</strong>. Расчёт и выгрузка в 1С заблокированы до урегулирования.
-          </div>
-        </div>
-        <span class="badge danger">Расчёт заблокирован</span>
-      </div>
-    `;
+    return {
+      tone: 'danger',
+      title: 'Спор при приёмке — расчёт заблокирован',
+      text: `Причина: «${trip.delivery.disputeReason}». Выгрузка в 1С недоступна, пока получатель не снимет спор.`,
+    };
   }
 
-  // 2. Pending version change (central feature!)
   if (pending) {
-    const timeChanged = confirmed && confirmed.loadingTime !== pending.loadingTime;
-    const dateChanged = confirmed && confirmed.loadingDate !== pending.loadingDate;
-    const rateChanged = confirmed && confirmed.rateRub !== pending.rateRub;
-
     let diffHtml = '';
     if (confirmed) {
       const parts = [];
-      if (timeChanged) {
+      if (confirmed.loadingTime !== pending.loadingTime) {
         parts.push(`<span class="diff-pill num"><span class="diff-old">${esc(confirmed.loadingTime)}</span><span class="diff-arrow">→</span><span class="diff-new">${esc(pending.loadingTime)}</span></span>`);
       }
-      if (dateChanged) {
+      if (confirmed.loadingDate !== pending.loadingDate) {
         parts.push(`<span class="diff-pill num"><span class="diff-old">${esc(formatDateRu(confirmed.loadingDate))}</span><span class="diff-arrow">→</span><span class="diff-new">${esc(formatDateRu(pending.loadingDate))}</span></span>`);
       }
-      if (rateChanged) {
+      if (confirmed.rateRub !== pending.rateRub) {
         parts.push(`<span class="diff-pill num"><span class="diff-old">${esc(formatRub(confirmed.rateRub))}</span><span class="diff-arrow">→</span><span class="diff-new">${esc(formatRub(pending.rateRub))}</span></span>`);
       }
-      diffHtml = `<div class="btn-row">${parts.join('')}</div>`;
+      diffHtml = parts.length ? `<div class="diff-row">${parts.join('')}</div>` : '';
     } else {
-      diffHtml = `<div class="action-banner-text">Исходные условия v1: погрузка ${esc(formatDateRu(pending.loadingDate))} в <strong>${esc(pending.loadingTime)}</strong>, ставка <strong>${esc(formatRub(pending.rateRub))}</strong>.</div>`;
+      diffHtml = `<div class="diff-row"><span class="diff-pill num">${esc(formatDateRu(pending.loadingDate))}, <strong>${esc(pending.loadingTime)}</strong></span><span class="diff-pill num"><strong>${esc(formatRub(pending.rateRub))}</strong></span></div>`;
     }
+    const author = `Автор: ${esc(pending.proposedByName)}${pending.note ? ` · «${esc(pending.note)}»` : ''}`;
+    const acc = role === 'accountant'
+      ? `<br/><strong>Для бухгалтерии:</strong> неподтверждённая правка в расчёт не передана. Актуальная ставка: ${confirmed ? esc(formatRub(confirmed.rateRub)) : 'ещё не согласована'}.`
+      : '';
+    return {
+      tone: 'warning',
+      title: confirmed ? `Новые условия (v${pending.version}) ждут подтверждения` : 'Перевозчик должен принять условия рейса',
+      text: `${author}${acc}`,
+      extra: diffHtml,
+    };
+  }
 
-    const confirmBtnLabel = confirmed && timeChanged
+  if (doc && doc.status === 'returned') {
+    return {
+      tone: 'danger',
+      title: 'Накладную нужно исправить',
+      text: `Замечание (${doc.reviewedBy}): «${doc.reviewComment}»`,
+    };
+  }
+
+  if (doc && doc.status === 'submitted') {
+    return {
+      tone: 'info',
+      title: 'Накладная загружена и ждёт проверки',
+      text: `Файл «${doc.fileName}», версия v${doc.version}. Её принимает логист или бухгалтер.`,
+    };
+  }
+
+  if (trip.delivery.status !== 'confirmed') {
+    return {
+      tone: 'info',
+      title: 'Ждём подтверждения получения груза',
+      text: `Получение подтверждает ${trip.receiverName}. Если есть расхождение, его нужно зафиксировать сразу.`,
+    };
+  }
+
+  if (!doc) {
+    return {
+      tone: 'warning',
+      title: 'Нужна транспортная накладная',
+      text: 'Груз получен. Перевозчик прикладывает скан накладной, дальше её проверяют.',
+    };
+  }
+
+  if (trip.accounting.exportRecord) {
+    const rec = trip.accounting.exportRecord;
+    return {
+      tone: 'success',
+      title: 'Рейс закрыт — выгрузка для 1С сформирована',
+      text: `Распоряжение ${rec.dispatchNumber} · ${formatTimestamp(rec.createdAt)}. Повторное скачивание не создаёт дубль.`,
+    };
+  }
+
+  return {
+    tone: 'success',
+    title: 'Готов к расчёту',
+    text: `Условия v${confirmed.version} согласованы, груз получен, накладная принята. Сумма к сверке: ${formatRub(confirmed.rateRub)}.`,
+  };
+}
+
+function renderUploadBlock(latestDoc) {
+  const returned = latestDoc?.status === 'returned';
+  return `
+    <div class="inline-panel form-stack">
+      <div class="panel-title">${returned ? 'Приложите исправленную накладную' : 'Приложите транспортную накладную'}</div>
+      <div class="doc-presets">
+        ${appState.demoDocumentPresets
+          .map((p) => {
+            const recommended = returned && p.id === 'tn_signed_complete';
+            return `
+          <button type="button" class="preset-card preset-doc-btn ${recommended ? 'recommended' : ''}" data-preset-id="${esc(p.id)}">
+            <span class="preset-icon">${ICON.doc}</span>
+            <span>
+              <span class="preset-name">${esc(p.label)}</span>
+              <span class="preset-desc" style="display:block">${esc(p.description || 'Демо-файл для быстрого показа')}</span>
+            </span>
+          </button>`;
+          })
+          .join('')}
+      </div>
+      <label class="field">
+        <span>Или загрузите свой файл (PDF / JPG / TXT)</span>
+        <input type="file" id="customDocFileInput" />
+      </label>
+    </div>
+  `;
+}
+
+function renderActionCard(trip) {
+  const s = trip.summary;
+  const role = appState.roleId;
+  const nar = buildNarrative(trip);
+  const actions = getRoleActions(trip);
+  const mine = hasPrimaryAction(actions) && isMyTurn(trip);
+  const pending = s.pendingVersion;
+  const confirmed = s.confirmedVersion;
+  const doc = s.latestDoc;
+  const exported = Boolean(trip.accounting.exportRecord);
+
+  const body = [];
+
+  if (actions.confirmPending) {
+    const timeChanged = confirmed && confirmed.loadingTime !== pending.loadingTime;
+    const label = confirmed && timeChanged
       ? `Подтвердить ${pending.loadingTime}`
       : confirmed
         ? `Подтвердить v${pending.version}`
         : `Принять условия (${pending.loadingTime})`;
-
-    const carrierAction = role === 'carrier'
-      ? `<button type="button" class="btn btn-primary btn-lg" id="confirmPendingBtn" data-version-id="${esc(pending.id)}">${esc(confirmBtnLabel)}</button>`
-      : `<span class="badge warning">Ждём перевозчика</span>`;
-
-    const accountantWarning = role === 'accountant'
-      ? `<div class="action-banner-text" style="margin-top:6px;"><strong>Для бухгалтерии:</strong> неподтверждённая правка v${pending.version} в расчёт не передана. Актуальная согласованная ставка: ${confirmed ? formatRub(confirmed.rateRub) : 'ещё не согласована'}.</div>`
-      : '';
-
-    return `
-      <div class="action-banner warning">
-        <div>
-          <div class="action-banner-title">Ожидает подтверждения перевозчика (версия v${pending.version})</div>
-          ${diffHtml}
-          <div class="action-banner-text">
-            Автор изменения: ${esc(pending.proposedByName)}${pending.note ? ` · «${esc(pending.note)}»` : ''}
-          </div>
-          ${accountantWarning}
-        </div>
-        <div>${carrierAction}</div>
-      </div>
-    `;
+    body.push(`<div class="btn-row"><button type="button" class="btn btn-primary btn-lg" id="confirmPendingBtn" data-version-id="${esc(pending.id)}">${esc(label)}</button></div>`);
   }
 
-  // 3. Returned document
-  if (s.latestDoc && s.latestDoc.status === 'returned') {
-    return `
-      <div class="action-banner danger">
-        <div>
-          <div class="action-banner-title">Исправить накладную — документ возвращён на доработку</div>
-          <div class="action-banner-text">
-            Замечание (${esc(s.latestDoc.reviewedBy)}): <strong>«${esc(s.latestDoc.reviewComment)}»</strong>
-          </div>
-        </div>
-        <span class="badge danger">Ответственный: ${esc(trip.carrierName)}</span>
+  if (actions.delivery) {
+    body.push(`
+      <div class="btn-row">
+        <button type="button" class="btn btn-success btn-lg" id="confirmDeliveryBtn">
+          ${trip.delivery.status === 'disputed' ? 'Снять спор и подтвердить получение' : 'Подтвердить получение груза'}
+        </button>
+        ${trip.delivery.status !== 'disputed' ? '<button type="button" class="btn btn-danger-outline btn-lg" id="toggleDisputeBtn">Есть расхождение</button>' : ''}
       </div>
-    `;
+      ${appState.showDisputeForm ? `
+        <form id="disputeForm" class="inline-panel form-stack">
+          <label class="field">
+            <span>Причина расхождения (заблокирует расчёт)</span>
+            <textarea name="disputeReason" rows="2" required placeholder="Например: Повреждена обрешётка одного места оборудования">Повреждена обрешётка одного места оборудования</textarea>
+          </label>
+          <div class="btn-row">
+            <button type="submit" class="btn btn-danger-outline btn-sm">Зафиксировать расхождение</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="cancelDisputeBtn">Отмена</button>
+          </div>
+        </form>` : ''}
+    `);
   }
 
-  // 4. Ready for settlement
-  if (s.settlement.ready) {
-    return `
-      <div class="action-banner success">
-        <div>
-          <div class="action-banner-title">Готов к расчёту — все условия и документы согласованы</div>
-          <div class="action-banner-text">
-            Принята версия v${confirmed.version} (${esc(confirmed.loadingTime)}, ${esc(formatRub(confirmed.rateRub))}), доставка подтверждена, комплект принят.
-          </div>
+  if (actions.upload) body.push(renderUploadBlock(doc));
+
+  if (actions.review) {
+    body.push(`
+      <div class="inline-panel form-stack">
+        <div class="panel-title">Проверка накладной v${doc.version}: ${esc(doc.fileName)}</div>
+        <div class="btn-row">
+          <button type="button" class="btn btn-success" id="acceptDocBtn" data-doc-id="${esc(doc.id)}">Принять документ</button>
+          <button type="button" class="btn btn-danger-outline" id="toggleReturnDocBtn">Вернуть с замечанием</button>
         </div>
-        <span class="badge success">${trip.accounting.exportRecord ? `Выгружено (${esc(trip.accounting.exportRecord.dispatchNumber)})` : 'Готов к расчёту'}</span>
+        ${appState.showReturnDocForm ? `
+          <form id="returnDocForm" class="form-stack" data-doc-id="${esc(doc.id)}">
+            <label class="field">
+              <span>Конкретное замечание перевозчику</span>
+              <input type="text" name="comment" required value="На второй странице накладной не видна подпись" />
+            </label>
+            <div class="btn-row">
+              <button type="submit" class="btn btn-danger-outline btn-sm">Отправить замечание</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="cancelReturnDocBtn">Отмена</button>
+            </div>
+          </form>` : ''}
       </div>
-    `;
+    `);
   }
 
-  // 5. Normal next step
+  if (actions.export) {
+    body.push(`
+      <div class="btn-row">
+        <button type="button" class="btn btn-primary btn-lg" id="export1cBtn" ${appState.exportInFlight ? 'disabled' : ''}>
+          ${ICON.download}
+          ${exported ? 'Скачать выгрузку повторно' : 'Скачать выгрузку для 1С (демо)'}
+        </button>
+      </div>
+    `);
+  }
+
+  if (!hasPrimaryAction(actions)) {
+    const ownerRole = s.ownerRole;
+    const ownerPerson = appState.roles.find((r) => r.id === ownerRole);
+    const canSwitch = !exported && ownerRole !== role && ownerPerson;
+    body.push(`
+      <div class="waiting-box">
+        <span>${exported ? 'Рейс завершён, действий не требуется.' : `От вас ничего не требуется. Сейчас ход у: <strong>${esc(s.ownerLabel)}</strong>.`}</span>
+        ${canSwitch ? `<button type="button" class="btn btn-secondary btn-sm" data-switch-role="${esc(ownerRole)}">Показать глазами роли «${esc(ownerPerson.label)}» →</button>` : ''}
+      </div>
+    `);
+  }
+
+  // Второстепенные действия, которые роль может сделать в любой момент
+  const secondary = [];
+  if (actions.disputeLate) {
+    secondary.push('<button type="button" class="btn-link danger" id="toggleDisputeBtn">Отметить расхождение</button>');
+  }
+  if (secondary.length) body.push(`<div class="secondary-actions">${secondary.join('')}</div>`);
+  if (actions.disputeLate && appState.showDisputeForm) {
+    body.push(`
+      <form id="disputeForm" class="inline-panel form-stack">
+        <label class="field">
+          <span>Причина расхождения (заблокирует расчёт)</span>
+          <textarea name="disputeReason" rows="2" required>Повреждена обрешётка одного места оборудования</textarea>
+        </label>
+        <div class="btn-row">
+          <button type="submit" class="btn btn-danger-outline btn-sm">Зафиксировать расхождение</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="cancelDisputeBtn">Отмена</button>
+        </div>
+      </form>
+    `);
+  }
+
+  const eyebrow = mine
+    ? '<span class="badge accent plain">Ваш ход</span>'
+    : exported
+      ? '<span class="badge success">Завершено</span>'
+      : `<span class="badge neutral plain">Ход: ${esc(s.ownerLabel)}</span>`;
+
   return `
-    <div class="action-banner info">
-      <div>
-        <div class="action-banner-title">Следующее действие: ${esc(s.nextAction)}</div>
-        <div class="action-banner-text">
-          Ответственный сейчас: <strong>${esc(s.ownerLabel)}</strong>.
-          ${confirmed ? `Согласована версия v${confirmed.version}: погрузка ${esc(formatDateRu(confirmed.loadingDate))} в ${esc(confirmed.loadingTime)}, ставка ${esc(formatRub(confirmed.rateRub))}.` : ''}
+    <section class="action-card tone-${esc(nar.tone)}" aria-label="Что делать сейчас">
+      <div class="action-head">
+        <div>
+          <div class="action-eyebrow">Что делать сейчас ${eyebrow}</div>
+          <h2 class="action-title">${esc(nar.title)}</h2>
+          <p class="action-text">${nar.text}</p>
+          ${nar.extra || ''}
         </div>
       </div>
-      <span class="badge ${esc(s.nextActionTone)}">${esc(s.nextAction)}</span>
-    </div>
+      <div class="action-body">${body.join('')}</div>
+    </section>
   `;
+}
+
+function renderProposePanel(trip) {
+  const latest = trip.versions[trip.versions.length - 1];
+  return `
+    <form id="proposeTermsForm" class="card form-stack">
+      <div class="card-header" style="margin-bottom:0">
+        <div>
+          <h3 class="card-title">Предложить изменение условий</h3>
+          <p class="card-desc">Создаст версию v${latest.version + 1}. Она вступит в силу только после подтверждения перевозчика.</p>
+        </div>
+        <button type="button" class="btn btn-secondary btn-sm" id="quickShift14Btn">Быстро: 14:00</button>
+      </div>
+      <div class="form-grid-3">
+        <label class="field">
+          <span>Дата погрузки</span>
+          <input type="date" name="loadingDate" required value="${esc(latest.loadingDate)}" />
+        </label>
+        <label class="field">
+          <span>Новое время погрузки</span>
+          <input type="time" name="loadingTime" id="proposeTimeInput" required value="${latest.loadingTime === '10:00' ? '14:00' : esc(latest.loadingTime)}" />
+        </label>
+        <label class="field">
+          <span>Ставка, ₽</span>
+          <input type="number" name="rateRub" required min="1000" step="500" value="${esc(latest.rateRub)}" />
+        </label>
+      </div>
+      <label class="field">
+        <span>Комментарий к изменению</span>
+        <input type="text" name="note" value="Склад перенёс окно отгрузки" placeholder="Например: Склад перенёс окно отгрузки" />
+      </label>
+      <div class="btn-row">
+        <button type="submit" class="btn btn-primary">Отправить перевозчику</button>
+        <button type="button" class="btn btn-secondary" id="cancelProposeBtn">Отмена</button>
+      </div>
+    </form>
+  `;
+}
+
+function renderTermsCard(trip) {
+  const role = appState.roleId;
+  const versions = [...trip.versions].reverse();
+  const currentId = trip.summary.confirmedVersion?.id;
+  return `
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">Условия и история версий</h3>
+          <p class="card-desc">Каждое изменение — новая версия. Согласованные условия не перезаписываются.</p>
+        </div>
+      </div>
+      <ul class="version-list">
+        ${versions.map((v) => `
+          <li class="version-item ${v.id === currentId ? 'current' : ''} ${v.status === 'superseded' ? 'superseded' : ''}">
+            <span class="version-tag num">v${v.version}</span>
+            <div class="version-main">
+              <div class="version-line num">
+                ${esc(formatDateRu(v.loadingDate))}, <strong>${esc(v.loadingTime)}</strong>
+                <span class="muted"> · ${role === 'accountant' && v.status !== 'confirmed' ? 'ставка не передана в расчёт' : esc(formatRub(v.rateRub))}</span>
+              </div>
+              <div class="version-note">${esc(v.proposedByName)} · ${esc(v.note || 'без комментария')} · ${esc(formatTimestamp(v.proposedAt))}</div>
+            </div>
+            <div class="version-status">
+              ${renderVersionStatusBadge(v.status)}
+              ${v.confirmedAt ? `<small>${esc(v.confirmedByName)} · ${esc(formatTimestamp(v.confirmedAt))}</small>` : ''}
+            </div>
+          </li>
+        `).join('')}
+      </ul>
+    </section>
+  `;
+}
+
+function renderDocsCard(trip) {
+  const docs = [...trip.documents].reverse();
+  return `
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">Транспортная накладная</h3>
+          <p class="card-desc">Перевозчик прикладывает, логист или бухгалтер принимает либо возвращает с замечанием.</p>
+        </div>
+        <span class="badge ${trip.summary.latestDoc?.status === 'accepted' ? 'success' : trip.summary.latestDoc?.status === 'returned' ? 'danger' : trip.summary.latestDoc ? 'info' : 'neutral'}">${esc(trip.summary.docStatusLabel)}</span>
+      </div>
+      ${docs.length ? `
+        <ul class="version-list">
+          ${docs.map((d) => `
+            <li class="version-item ${d.id === trip.summary.latestDoc?.id ? 'current' : 'superseded'}">
+              <span class="version-tag num">v${d.version}</span>
+              <div class="version-main">
+                <div class="version-line">${esc(d.fileName)}</div>
+                <div class="version-note">Загружена ${esc(formatTimestamp(d.uploadedAt))}</div>
+                ${d.reviewComment ? `<div class="doc-comment">«${esc(d.reviewComment)}»${d.reviewedBy ? ` — ${esc(d.reviewedBy)}` : ''}</div>` : ''}
+              </div>
+              <div class="version-status">${renderDocStatusBadge(d.status)}</div>
+            </li>
+          `).join('')}
+        </ul>
+      ` : '<div class="alert-box">Накладная ещё не приложена.</div>'}
+    </section>
+  `;
+}
+
+function checklistItem(ok, bad, text) {
+  const cls = bad ? 'bad' : ok ? 'ok' : '';
+  return `<li class="${cls}"><span class="check-mark">${bad ? ICON.cross : ICON.check}</span><span>${esc(text)}</span></li>`;
+}
+
+function renderSideCards(trip) {
+  const s = trip.summary;
+  const role = appState.roleId;
+  const confirmed = s.confirmedVersion;
+  const pending = s.pendingVersion;
+  const latest = trip.versions[trip.versions.length - 1];
+  const doc = s.latestDoc;
+  const integrityResult = appState.integrityResultByTrip[trip.id] || null;
+  const disputed = trip.delivery.status === 'disputed';
+
+  const rateNote = pending && confirmed && pending.rateRub !== confirmed.rateRub
+    ? (role === 'accountant' ? 'Неподтверждённая ставка скрыта от расчёта' : `Предложено ${formatRub(pending.rateRub)} · не подтверждено`)
+    : confirmed
+      ? 'Подтверждена обеими сторонами'
+      : `Предложено логистом: ${formatRub(latest.rateRub)}`;
+
+  const timeValue = confirmed
+    ? `${formatDateRu(confirmed.loadingDate)}, ${confirmed.loadingTime}`
+    : `${formatDateRu(latest.loadingDate)}, ${latest.loadingTime}`;
+
+  const facts = `
+    <section class="card">
+      <div class="fact-hero">
+        <div class="label">Ставка (согласовано)</div>
+        <div class="value num">${confirmed ? esc(formatRub(confirmed.rateRub)) : 'Не согласована'}</div>
+        <div class="note">${esc(rateNote)}</div>
+      </div>
+      <dl class="facts">
+        <div class="fact"><dt>Погрузка</dt><dd class="num">${esc(timeValue)}${confirmed ? '' : ' · ожидает'}</dd></div>
+        <div class="fact"><dt>Перевозчик</dt><dd>${esc(trip.carrierName)}</dd></div>
+        <div class="fact"><dt>Получатель</dt><dd>${esc(trip.receiverName)}</dd></div>
+        <div class="fact"><dt>Грузоотправитель</dt><dd>${esc(trip.shipperName)}</dd></div>
+      </dl>
+    </section>
+  `;
+
+  const termsOk = Boolean(confirmed) && !pending;
+  const deliveryOk = trip.delivery.status === 'confirmed';
+  const docOk = doc?.status === 'accepted';
+  const exportRec = trip.accounting.exportRecord;
+
+  const checklist = `
+    <section class="card">
+      <div class="card-header" style="margin-bottom:12px">
+        <div>
+          <h3 class="card-title">Готовность к расчёту</h3>
+          <p class="card-desc">${esc(s.settlement.label)}</p>
+        </div>
+        ${s.settlement.ready ? '<span class="badge success">Можно выгружать</span>' : disputed ? '<span class="badge danger">Заблокирован</span>' : ''}
+      </div>
+      <ul class="checklist">
+        ${checklistItem(termsOk, false, 'Условия подтверждены перевозчиком')}
+        ${checklistItem(deliveryOk, disputed, disputed ? `Спор: ${trip.delivery.disputeReason}` : 'Получатель подтвердил приёмку')}
+        ${checklistItem(docOk, doc?.status === 'returned', doc?.status === 'returned' ? 'Накладная возвращена на исправление' : 'Накладная принята')}
+        ${checklistItem(Boolean(exportRec), false, exportRec ? `Выгружено · ${exportRec.dispatchNumber}` : 'Выгрузка для 1С сформирована')}
+      </ul>
+      ${exportRec ? `
+        <div class="alert-box success" style="margin-top:14px">
+          Файл: ${esc(exportRec.fileName)}
+          <small>${esc(exportRec.demoLabel)} · ${esc(formatTimestamp(exportRec.createdAt))}</small>
+        </div>` : ''}
+    </section>
+  `;
+
+  const integrity = `
+    <section class="card">
+      <details class="disclosure" style="border-top:0" ${integrityResult ? 'open' : ''}>
+        <summary style="padding-top:0">Контроль целостности (SHA-256)</summary>
+        <div class="disclosure-body">
+          <p class="card-desc">Локальная проверка: показывает, изменилось ли содержимое файла условий. Блокчейн-реестр, банк и живая 1С — следующий этап.</p>
+          ${confirmed ? `
+            <div class="hash-box">
+              <div class="hash-label">Эталон v${confirmed.version} (${esc(confirmed.loadingTime)}, ${esc(formatRub(confirmed.rateRub))})</div>
+              <div class="mono">${esc(confirmed.sha256)}</div>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="btn btn-secondary btn-sm verify-sample-btn" data-variant="original">Исходный файл</button>
+              <button type="button" class="btn btn-secondary btn-sm verify-sample-btn" data-variant="tampered">Изменённый файл</button>
+            </div>
+            <label class="field">
+              <span>Или любой локальный файл</span>
+              <input type="file" id="integrityFileInput" />
+            </label>
+            ${integrityResult ? `
+              <div class="alert-box ${integrityResult.match ? 'success' : 'danger'}">
+                <strong>${esc(integrityResult.statusLabel)}</strong>
+                <small>${esc(integrityResult.diffSummary)}</small>
+                <small><b>Файл:</b> ${esc(integrityResult.checkedFileName)}</small>
+                <small><b>Эталон v${integrityResult.confirmedVersionNumber}:</b> <span class="mono">${esc(integrityResult.expectedHash)}</span></small>
+                <small><b>Проверяемый:</b> <span class="mono">${esc(integrityResult.actualHash)}</span></small>
+              </div>` : ''}
+          ` : '<div class="alert-box">Контрольная сумма появится после подтверждения условий перевозчиком.</div>'}
+        </div>
+      </details>
+    </section>
+  `;
+
+  const events = [...trip.history].reverse();
+  const timelineHtml = (list) => `
+    <ul class="timeline">
+      ${list.map((ev) => `
+        <li class="timeline-item">
+          <span class="timeline-dot"></span>
+          <div>
+            <div class="timeline-title">${esc(ev.title)}</div>
+            <div class="timeline-detail">${esc(ev.detail)}</div>
+            <div class="timeline-meta">${esc(formatTimestamp(ev.at))} · ${esc(ev.actorName)}</div>
+          </div>
+        </li>`).join('')}
+    </ul>`;
+
+  const history = `
+    <section class="card">
+      <div class="card-header" style="margin-bottom:12px">
+        <div>
+          <h3 class="card-title">История событий</h3>
+          <p class="card-desc">Всего событий: ${events.length}</p>
+        </div>
+      </div>
+      ${timelineHtml(events.slice(0, 4))}
+      ${events.length > 4 ? `
+        <details class="disclosure" style="margin-top:14px">
+          <summary>Показать всю историю</summary>
+          <div class="disclosure-body">${timelineHtml(events.slice(4))}</div>
+        </details>` : ''}
+    </section>
+  `;
+
+  return facts + checklist + integrity + history;
 }
 
 function renderTripDetail() {
@@ -408,439 +941,53 @@ function renderTripDetail() {
 
   const s = trip.summary;
   const role = appState.roleId;
-  const confirmed = s.confirmedVersion;
-  const pending = s.pendingVersion;
-  const latest = trip.versions[trip.versions.length - 1];
-  const latestDoc = s.latestDoc;
 
-  // Displayed KPI values: Accountant strictly sees ONLY confirmed values
-  const kpiTime = confirmed
-    ? `${formatDateRu(confirmed.loadingDate)}, ${confirmed.loadingTime}`
-    : `${formatDateRu(latest.loadingDate)}, ${latest.loadingTime} (ожидает)`;
-  const kpiTimeNote = pending && confirmed
-    ? `Предложено: ${confirmed.loadingTime} → ${pending.loadingTime}`
-    : confirmed
-      ? `Согласована версия v${confirmed.version}`
-      : 'Ждём подтверждения перевозчика';
-
-  const kpiRate = confirmed ? formatRub(confirmed.rateRub) : 'Не согласована';
-  const kpiRateNote = pending && confirmed && pending.rateRub !== confirmed.rateRub
-    ? (role === 'accountant'
-      ? 'Неподтверждённая ставка скрыта от расчёта'
-      : `Предложено: ${formatRub(pending.rateRub)} (не подтв.)`)
-    : confirmed
-      ? 'Подтверждена обеими сторонами'
-      : `Предложено логистом: ${formatRub(latest.rateRub)}`;
-
-  const integrityResult = appState.integrityResultByTrip[trip.id] || null;
+  const isNewTrip = appState.lastRenderedTripId !== trip.id;
+  appState.lastRenderedTripId = trip.id;
 
   els.tripDetailContent.innerHTML = `
-    <button type="button" class="btn btn-secondary btn-sm mobile-back-btn" id="mobileBackBtn">← К списку рейсов</button>
+    <div class="detail-stack ${isNewTrip ? 'enter' : ''}">
+      <button type="button" class="btn btn-secondary btn-sm mobile-back-btn" id="mobileBackBtn">← К списку рейсов</button>
 
-    <!-- HERO SUMMARY -->
-    <div class="card">
-      <div class="hero-header">
-        <div>
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px;">
-            <span class="badge neutral num">${esc(trip.number)}</span>
-            ${trip.isDemo ? '<span class="badge warning">Демо-рейс</span>' : '<span class="badge neutral">Создан вручную</span>'}
+      <section class="card hero">
+        <div class="hero-top">
+          <div class="hero-chips">
+            <span class="badge neutral plain num">${esc(trip.number)}</span>
+            ${trip.isDemo ? '<span class="badge warning plain">Демо-рейс</span>' : '<span class="badge neutral plain">Создан вручную</span>'}
             <span class="badge ${esc(s.nextActionTone)}">${esc(s.nextAction)}</span>
           </div>
-          <h2 class="hero-route">${esc(trip.origin)} → ${esc(trip.destination)}</h2>
-          <div class="hero-sub">${esc(trip.cargo)} · Грузоотправитель: ${esc(trip.shipperName)} · Получатель: ${esc(trip.receiverName)}</div>
-        </div>
-        ${role === 'logist' ? `
-          <div class="btn-row">
-            <button type="button" class="btn btn-primary btn-sm" id="toggleProposeBtn">
+          ${role === 'logist' ? `
+            <button type="button" class="btn btn-secondary btn-sm" id="toggleProposeBtn">
               ${appState.showProposeForm ? 'Скрыть форму правки' : 'Изменить время / условия'}
-            </button>
-          </div>
-        ` : ''}
+            </button>` : ''}
+        </div>
+        <div class="route-line">
+          <span class="route-city">${esc(trip.origin)}</span>
+          <span class="route-path" aria-hidden="true"><span class="route-dot"></span><span class="route-rail"></span><span class="route-dot end"></span></span>
+          <span class="route-city">${esc(trip.destination)}</span>
+        </div>
+        <div class="hero-sub"><span>${esc(trip.cargo)}</span></div>
+        ${renderStepper(trip)}
+      </section>
+
+      <div class="detail-grid">
+        <div class="detail-main">
+          ${renderActionCard(trip)}
+          ${role === 'logist' && appState.showProposeForm ? renderProposePanel(trip) : ''}
+          ${renderTermsCard(trip)}
+          ${renderDocsCard(trip)}
+        </div>
+        <aside class="detail-side">
+          ${renderSideCards(trip)}
+        </aside>
       </div>
-
-      <div class="kpi-grid">
-        <div class="kpi-box">
-          <div class="kpi-label">Погрузка (согласовано)</div>
-          <div class="kpi-value num">${esc(kpiTime)}</div>
-          <div class="kpi-note">${esc(kpiTimeNote)}</div>
-        </div>
-        <div class="kpi-box">
-          <div class="kpi-label">Ставка</div>
-          <div class="kpi-value num">${esc(kpiRate)}</div>
-          <div class="kpi-note">${esc(kpiRateNote)}</div>
-        </div>
-        <div class="kpi-box">
-          <div class="kpi-label">Перевозчик</div>
-          <div class="kpi-value">${esc(trip.carrierName)}</div>
-          <div class="kpi-note">Документы: ${esc(s.docStatusLabel)}</div>
-        </div>
-        <div class="kpi-box">
-          <div class="kpi-label">Ответственный сейчас</div>
-          <div class="kpi-value">${esc(s.ownerLabel)}</div>
-          <div class="kpi-note">${esc(s.settlement.label)}</div>
-        </div>
-      </div>
-
-      ${renderActionBanner(trip)}
-    </div>
-
-    <!-- TERMS & VERSIONS -->
-    <div class="card">
-      <div class="card-header">
-        <div>
-          <h3 class="card-title">Условия и история версий</h3>
-          <p class="card-desc">Каждое изменение сохраняется как новая версия. Прежние согласованные условия не перезаписываются.</p>
-        </div>
-      </div>
-
-      ${role === 'logist' && appState.showProposeForm ? `
-        <form id="proposeTermsForm" class="inline-panel form-stack">
-          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-            <strong>Предложить изменение условий (создаст v${latest.version + 1})</strong>
-            <button type="button" class="btn btn-secondary btn-sm" id="quickShift14Btn">Быстро: перенести на 14:00</button>
-          </div>
-          <div class="form-grid-3">
-            <label class="field">
-              <span>Дата погрузки</span>
-              <input type="date" name="loadingDate" required value="${esc(latest.loadingDate)}" />
-            </label>
-            <label class="field">
-              <span>Новое время погрузки</span>
-              <input type="time" name="loadingTime" id="proposeTimeInput" required value="${latest.loadingTime === '10:00' ? '14:00' : esc(latest.loadingTime)}" />
-            </label>
-            <label class="field">
-              <span>Ставка, ₽</span>
-              <input type="number" name="rateRub" required min="1000" step="500" value="${esc(latest.rateRub)}" />
-            </label>
-          </div>
-          <label class="field">
-            <span>Комментарий к изменению</span>
-            <input type="text" name="note" value="Склад перенёс окно отгрузки" placeholder="Например: Склад перенёс окно отгрузки" />
-          </label>
-          <div class="btn-row">
-            <button type="submit" class="btn btn-primary btn-sm">Отправить перевозчику на подтверждение</button>
-            <button type="button" class="btn btn-secondary btn-sm" id="cancelProposeBtn">Отмена</button>
-          </div>
-        </form>
-      ` : ''}
-
-      <div class="table-wrap">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>Версия</th>
-              <th>Дата и время</th>
-              <th>Ставка</th>
-              <th>Автор и комментарий</th>
-              <th>Статус</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${[...trip.versions].reverse().map((v) => `
-              <tr>
-                <td class="num"><strong>v${v.version}</strong></td>
-                <td class="num">${esc(formatDateRu(v.loadingDate))}, <strong>${esc(v.loadingTime)}</strong></td>
-                <td class="num">${role === 'accountant' && v.status !== 'confirmed' ? '<span style="color:var(--text-muted)">Не передана в расчёт</span>' : esc(formatRub(v.rateRub))}</td>
-                <td>
-                  <div>${esc(v.proposedByName)}</div>
-                  <div style="font-size:12px;color:var(--text-muted);">${esc(v.note || '—')} · ${esc(formatTimestamp(v.proposedAt))}</div>
-                </td>
-                <td>
-                  ${renderVersionStatusBadge(v.status)}
-                  ${v.confirmedAt ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px;">Подтвердил: ${esc(v.confirmedByName)} (${esc(formatTimestamp(v.confirmedAt))})</div>` : ''}
-                </td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- DELIVERY & DOCUMENTS -->
-    <div class="section-grid-2">
-      <!-- Delivery Acceptance -->
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <h3 class="card-title">Приёмка груза</h3>
-            <p class="card-desc">Факт доставки подтверждает уполномоченный получатель (${esc(trip.receiverName)}).</p>
-          </div>
-          ${trip.delivery.status === 'confirmed'
-            ? '<span class="badge success">Груз получен</span>'
-            : trip.delivery.status === 'disputed'
-              ? '<span class="badge danger">Спор при приёмке</span>'
-              : '<span class="badge neutral">Ожидает разгрузки</span>'}
-        </div>
-
-        ${trip.delivery.status === 'confirmed' ? `
-          <div class="alert-box success">
-            Получение груза подтверждено без расхождений.<br/>
-            <span style="font-size:12px;">${esc(trip.delivery.updatedBy)} · ${esc(formatTimestamp(trip.delivery.updatedAt))}</span>
-          </div>
-        ` : ''}
-
-        ${trip.delivery.status === 'disputed' ? `
-          <div class="alert-box danger">
-            <strong>Зафиксировано расхождение:</strong> ${esc(trip.delivery.disputeReason)}<br/>
-            <span style="font-size:12px;">${esc(trip.delivery.updatedBy)} · ${esc(formatTimestamp(trip.delivery.updatedAt))}</span>
-          </div>
-        ` : ''}
-
-        ${role === 'receiver' ? `
-          <div class="btn-row" style="margin-bottom:10px;">
-            <button type="button" class="btn btn-success btn-sm" id="confirmDeliveryBtn">
-              ${trip.delivery.status === 'disputed' ? 'Снять спор и подтвердить получение' : 'Подтвердить получение груза'}
-            </button>
-            <button type="button" class="btn btn-danger-outline btn-sm" id="toggleDisputeBtn">
-              Отметить расхождение
-            </button>
-          </div>
-
-          ${appState.showDisputeForm ? `
-            <form id="disputeForm" class="inline-panel form-stack">
-              <label class="field">
-                <span>Причина расхождения (блокирует расчёт)</span>
-                <textarea name="disputeReason" rows="2" required placeholder="Например: Повреждена обрешётка одного места оборудования">Повреждена обрешётка одного места оборудования</textarea>
-              </label>
-              <div class="btn-row">
-                <button type="submit" class="btn btn-danger-outline btn-sm">Зафиксировать расхождение</button>
-                <button type="button" class="btn btn-secondary btn-sm" id="cancelDisputeBtn">Отмена</button>
-              </div>
-            </form>
-          ` : ''}
-        ` : `
-          <div class="alert-box neutral">
-            Переключитесь на роль <strong>«Получатель»</strong>, чтобы подтвердить получение груза или отметить расхождение.
-          </div>
-        `}
-      </div>
-
-      <!-- Documents -->
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <h3 class="card-title">Документы (транспортная накладная)</h3>
-            <p class="card-desc">Перевозчик прикладывает накладную, ответственный принимает или возвращает с замечанием.</p>
-          </div>
-          <span class="badge ${latestDoc?.status === 'accepted' ? 'success' : latestDoc?.status === 'returned' ? 'danger' : latestDoc ? 'info' : 'neutral'}">
-            ${esc(s.docStatusLabel)}
-          </span>
-        </div>
-
-        ${latestDoc && latestDoc.status === 'returned' ? `
-          <div class="alert-box danger">
-            <strong>Накладная v${latestDoc.version} возвращена на исправление:</strong><br/>
-            «${esc(latestDoc.reviewComment)}»
-            <div style="font-size:12px;margin-top:4px;">Проверил: ${esc(latestDoc.reviewedBy)} · ${esc(formatTimestamp(latestDoc.reviewedAt))}</div>
-          </div>
-        ` : ''}
-
-        ${role === 'carrier' ? `
-          <div class="inline-panel form-stack">
-            <div style="font-size:13px;font-weight:600;">
-              ${latestDoc?.status === 'returned' ? 'Приложить исправленную версию накладной' : 'Приложить транспортную накладную'}
-            </div>
-            <div class="btn-row">
-              ${appState.demoDocumentPresets.map((p) => `
-                <button type="button" class="btn ${latestDoc?.status === 'returned' && p.id === 'tn_signed_complete' ? 'btn-primary' : 'btn-secondary'} btn-sm preset-doc-btn" data-preset-id="${esc(p.id)}">
-                  ${esc(p.label)}
-                </button>
-              `).join('')}
-            </div>
-            <label class="field" style="margin-top:4px;">
-              <span>Или загрузить свой файл (PDF / JPG / TXT)</span>
-              <input type="file" id="customDocFileInput" />
-            </label>
-          </div>
-        ` : ''}
-
-        ${(role === 'logist' || role === 'accountant') && latestDoc && latestDoc.status === 'submitted' ? `
-          <div class="inline-panel form-stack">
-            <div style="font-size:13px;font-weight:600;">Проверка накладной v${latestDoc.version}: ${esc(latestDoc.fileName)}</div>
-            <div class="btn-row">
-              <button type="button" class="btn btn-success btn-sm" id="acceptDocBtn" data-doc-id="${esc(latestDoc.id)}">Принять документ</button>
-              <button type="button" class="btn btn-danger-outline btn-sm" id="toggleReturnDocBtn">Вернуть с замечанием</button>
-            </div>
-            ${appState.showReturnDocForm ? `
-              <form id="returnDocForm" class="form-stack" data-doc-id="${esc(latestDoc.id)}">
-                <label class="field">
-                  <span>Конкретное замечание перевозчику</span>
-                  <input type="text" name="comment" required value="На второй странице накладной не видна подпись" />
-                </label>
-                <div class="btn-row">
-                  <button type="submit" class="btn btn-danger-outline btn-sm">Отправить замечание</button>
-                  <button type="button" class="btn btn-secondary btn-sm" id="cancelReturnDocBtn">Отмена</button>
-                </div>
-              </form>
-            ` : ''}
-          </div>
-        ` : ''}
-
-        ${trip.documents.length > 0 ? `
-          <div class="table-wrap">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th>Версия</th>
-                  <th>Файл</th>
-                  <th>Статус и замечание</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${[...trip.documents].reverse().map((d) => `
-                  <tr>
-                    <td class="num"><strong>v${d.version}</strong></td>
-                    <td>
-                      <div>${esc(d.fileName)}</div>
-                      <div style="font-size:11px;color:var(--text-muted);">${esc(formatTimestamp(d.uploadedAt))}</div>
-                    </td>
-                    <td>
-                      ${renderDocStatusBadge(d.status)}
-                      ${d.reviewComment ? `<div style="font-size:12px;color:var(--danger);margin-top:4px;">«${esc(d.reviewComment)}»</div>` : ''}
-                    </td>
-                  </tr>
-                `).join('')}
-              </tbody>
-            </table>
-          </div>
-        ` : '<div style="font-size:13px;color:var(--text-muted);">Документы ещё не приложены.</div>'}
-      </div>
-    </div>
-
-    <!-- ACCOUNTING & INTEGRITY -->
-    <div class="section-grid-2">
-      <!-- Accounting / 1C Export -->
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <h3 class="card-title">Расчёт и передача в бухгалтерию</h3>
-            <p class="card-desc">Демонстрационная выгрузка для сверки с 1С доступна только при закрытии всех условий без споров.</p>
-          </div>
-          <span class="badge ${s.settlement.status === 'ready' ? 'success' : s.settlement.status === 'manual_review' ? 'danger' : 'neutral'}">
-            ${esc(s.settlement.label)}
-          </span>
-        </div>
-
-        ${s.settlement.status === 'manual_review' ? `
-          <div class="alert-box danger">
-            <strong>На ручной проверке.</strong> Причина блокировки: ${esc(s.settlement.disputeReason)}.
-            Выгрузка для бухгалтерии заблокирована даже при принятых документах.
-          </div>
-        ` : !s.settlement.ready ? `
-          <div class="alert-box neutral">
-            <strong>Почему рейс ещё не готов к расчёту:</strong>
-            <ul class="checklist">
-              ${s.settlement.blockers.map((b) => `<li>${esc(b)}</li>`).join('')}
-            </ul>
-          </div>
-        ` : `
-          <div class="alert-box success">
-            <strong>Готов к расчёту.</strong>
-            Согласованная ставка: <strong class="num">${esc(formatRub(confirmed.rateRub))}</strong> (версия v${confirmed.version}),
-            комплект принят (${esc(latestDoc.fileName)}), доставка подтверждена.
-          </div>
-        `}
-
-        ${confirmed ? `
-          <div style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;">
-            <div><strong>Согласованная версия:</strong> v${confirmed.version} · Погрузка ${esc(formatDateRu(confirmed.loadingDate))} в ${esc(confirmed.loadingTime)}</div>
-            <div><strong>Стороны:</strong> ${esc(trip.shipperName)} → ${esc(trip.carrierName)}</div>
-            <div><strong>Сумма к сверке:</strong> <span class="num"><strong>${esc(formatRub(confirmed.rateRub))}</strong></span></div>
-          </div>
-        ` : ''}
-
-        ${s.settlement.ready ? `
-          <div class="btn-row">
-            <button type="button" class="btn btn-primary" id="export1cBtn" ${appState.exportInFlight ? 'disabled' : ''}>
-              ${trip.accounting.exportRecord ? 'Скачать выгрузку повторно (без дубля)' : 'Скачать выгрузку для 1С (демо)'}
-            </button>
-          </div>
-          ${trip.accounting.exportRecord ? `
-            <div class="inline-panel" style="margin-top:12px;margin-bottom:0;font-size:12px;">
-              <div><strong>Распоряжение:</strong> <span class="num">${esc(trip.accounting.exportRecord.dispatchNumber)}</span> (повторный клик не создаёт второе распоряжение)</div>
-              <div><strong>Файл:</strong> ${esc(trip.accounting.exportRecord.fileName)} · <em>${esc(trip.accounting.exportRecord.demoLabel)}</em></div>
-              <div><strong>Сформировано:</strong> ${esc(formatTimestamp(trip.accounting.exportRecord.createdAt))}</div>
-            </div>
-          ` : ''}
-        ` : ''}
-      </div>
-
-      <!-- Local SHA-256 Integrity Check -->
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <h3 class="card-title">Контроль целостности (локальный SHA-256)</h3>
-            <p class="card-desc">
-              Это локальная SHA-256-проверка целостности согласованной версии условий. Она показывает изменение содержимого файла.
-              Факт доставки подтверждает получатель. Независимый реестр (блокчейн), банковский перевод и интеграция с живой 1С относятся к следующему этапу.
-            </p>
-          </div>
-        </div>
-
-        ${confirmed ? `
-          <div class="hash-box">
-            <div class="hash-label">Зафиксированный SHA-256 согласованной версии v${confirmed.version} (${esc(confirmed.loadingTime)}, ${esc(formatRub(confirmed.rateRub))})</div>
-            <div class="mono">${esc(confirmed.sha256)}</div>
-          </div>
-
-          <div class="btn-row" style="margin-bottom:10px;">
-            <button type="button" class="btn btn-secondary btn-sm verify-sample-btn" data-variant="original">
-              Проверить исходный демофайл
-            </button>
-            <button type="button" class="btn btn-secondary btn-sm verify-sample-btn" data-variant="tampered">
-              Проверить изменённый демофайл
-            </button>
-          </div>
-
-          <label class="field" style="margin-bottom:10px;">
-            <span>Или проверить произвольный локальный файл</span>
-            <input type="file" id="integrityFileInput" />
-          </label>
-
-          ${integrityResult ? `
-            <div class="alert-box ${integrityResult.match ? 'success' : 'danger'}" style="margin-bottom:0;">
-              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px;">
-                <strong>Результат: ${esc(integrityResult.statusLabel)}</strong>
-                <span class="badge ${integrityResult.match ? 'success' : 'danger'}">${esc(integrityResult.statusLabel)}</span>
-              </div>
-              <div style="font-size:12px;margin-bottom:6px;">${esc(integrityResult.diffSummary)}</div>
-              <div style="font-size:11px;"><strong>Файл:</strong> ${esc(integrityResult.checkedFileName)}</div>
-              <div style="font-size:11px;"><strong>Эталон (v${integrityResult.confirmedVersionNumber}):</strong> <span class="mono">${esc(integrityResult.expectedHash)}</span></div>
-              <div style="font-size:11px;"><strong>Проверяемый:</strong> <span class="mono">${esc(integrityResult.actualHash)}</span></div>
-            </div>
-          ` : ''}
-        ` : `
-          <div class="alert-box neutral">
-            Контрольная сумма станет доступна после подтверждения исходных условий перевозчиком.
-          </div>
-        `}
-      </div>
-    </div>
-
-    <!-- HISTORY -->
-    <div class="card">
-      <div class="card-header">
-        <div>
-          <h3 class="card-title">История событий по рейсу</h3>
-          <p class="card-desc">Полная хронология согласований, приёмки, документов и выгрузок.</p>
-        </div>
-      </div>
-      <ul class="timeline">
-        ${[...trip.history].reverse().map((ev) => `
-          <li class="timeline-item">
-            <div class="timeline-time num">${esc(formatTimestamp(ev.at))}</div>
-            <div>
-              <div class="timeline-title">${esc(ev.title)}</div>
-              <div class="timeline-detail">${esc(ev.detail)}</div>
-              <div class="timeline-actor">${esc(ev.actorName)}</div>
-            </div>
-          </li>
-        `).join('')}
-      </ul>
     </div>
   `;
 
   bindDetailEvents(trip);
+  document.querySelectorAll('[data-switch-role]').forEach((btn) => {
+    btn.addEventListener('click', () => switchRole(btn.dataset.switchRole, { notice: false }));
+  });
 }
 
 function triggerCsvDownload(fileName, csvContent) {
